@@ -1,6 +1,6 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { Download, ExternalLink, Grid3X3, ImageUp, SlidersHorizontal } from "lucide-react";
+import { Download, Grid3X3, ImageUp, SlidersHorizontal } from "lucide-react";
 import { MARD_PALETTE } from "./mardPalette";
 import "./styles.css";
 
@@ -23,9 +23,6 @@ type PaletteItem = {
   count: number;
 };
 
-type FitMode = "contain" | "cover";
-type PaletteStrategy = "usage" | "representative";
-
 const SAMPLE_IMAGE =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 480 360'%3E%3Cdefs%3E%3CradialGradient id='g' cx='48%25' cy='42%25' r='58%25'%3E%3Cstop offset='0' stop-color='%23fff2c4'/%3E%3Cstop offset='0.54' stop-color='%23f3a84f'/%3E%3Cstop offset='1' stop-color='%23545a9e'/%3E%3C/radialGradient%3E%3C/defs%3E%3Crect width='480' height='360' fill='%23eef2f5'/%3E%3Ccircle cx='240' cy='168' r='122' fill='url(%23g)'/%3E%3Ccircle cx='194' cy='138' r='18' fill='%23212b35'/%3E%3Ccircle cx='286' cy='138' r='18' fill='%23212b35'/%3E%3Cpath d='M194 210c30 34 76 34 106 0' fill='none' stroke='%23212b35' stroke-width='16' stroke-linecap='round'/%3E%3Cpath d='M147 94l-48-58 82 22zM333 94l48-58-82 22z' fill='%23f3a84f' stroke='%23212b35' stroke-width='8' stroke-linejoin='round'/%3E%3C/svg%3E";
 
@@ -35,10 +32,6 @@ function clamp(value: number, min = 0, max = 255) {
 
 function normalizeGridSize(value: number) {
   return Math.max(20, Math.min(150, Math.round(value / 5) * 5));
-}
-
-function normalizeExportResolution(value: number) {
-  return Math.max(1, Math.min(4, Math.round(value)));
 }
 
 function rgbToHex(color: Rgb) {
@@ -90,61 +83,64 @@ function contrastColor(color: Rgb) {
   return luminance > 0.62 ? "#111827" : "#FFFFFF";
 }
 
-function colorSaturation(color: Rgb) {
-  const max = Math.max(color.r, color.g, color.b);
-  const min = Math.min(color.r, color.g, color.b);
-  return max === 0 ? 0 : (max - min) / max;
+function kMeans(pixels: Rgb[], k: number): Rgb[] {
+  if (k >= pixels.length) return pixels.map((p) => ({ ...p }));
+
+  // k-means++ initialization
+  const centroids: Rgb[] = [pixels[Math.floor(Math.random() * pixels.length)]];
+  const dists = new Float64Array(pixels.length);
+  for (let i = 1; i < k; i++) {
+    let total = 0;
+    for (let j = 0; j < pixels.length; j++) {
+      const d = colorDistance(pixels[j], centroids[i - 1]);
+      dists[j] = Math.min(dists[j] || d, d);
+      total += dists[j];
+    }
+    let r = Math.random() * total;
+    let idx = 0;
+    while (r > dists[idx]) { r -= dists[idx]; idx++; }
+    centroids.push({ ...pixels[idx] });
+    dists.fill(0);
+  }
+
+  const assignments = new Uint16Array(pixels.length);
+  for (let iter = 0; iter < 20; iter++) {
+    let moved = false;
+    for (let i = 0; i < pixels.length; i++) {
+      let best = 0;
+      let bestDist = Number.POSITIVE_INFINITY;
+      for (let j = 0; j < k; j++) {
+        const d = colorDistance(pixels[i], centroids[j]);
+        if (d < bestDist) { bestDist = d; best = j; }
+      }
+      if (assignments[i] !== best) { assignments[i] = best; moved = true; }
+    }
+    if (!moved) break;
+
+    const counts = new Uint32Array(k);
+    const sums = new Float64Array(k * 3);
+    for (let i = 0; i < pixels.length; i++) {
+      const c = assignments[i];
+      counts[c]++;
+      sums[c * 3] += pixels[i].r;
+      sums[c * 3 + 1] += pixels[i].g;
+      sums[c * 3 + 2] += pixels[i].b;
+    }
+    for (let j = 0; j < k; j++) {
+      if (counts[j] > 0) {
+        centroids[j] = {
+          r: Math.round(sums[j * 3] / counts[j]),
+          g: Math.round(sums[j * 3 + 1] / counts[j]),
+          b: Math.round(sums[j * 3 + 2] / counts[j]),
+        };
+      }
+    }
+  }
+
+  return centroids;
 }
 
-function choosePaletteCodes(
-  counts: Map<string, number>,
-  colorCount: number,
-  strategy: PaletteStrategy,
-) {
-  const candidates = MARD_COLORS
-    .map((item) => ({
-      ...item,
-      count: counts.get(item.code) ?? 0,
-      saturation: colorSaturation(item.color),
-    }))
-    .filter((item) => item.count > 0);
-
-  if (strategy === "usage") {
-    return candidates
-      .sort((a, b) => b.count - a.count)
-      .slice(0, colorCount)
-      .map((item) => item.code);
-  }
-
-  const totalPixels = candidates.reduce((sum, item) => sum + item.count, 0);
-  const grayLimit = Math.max(2, Math.ceil(colorCount * 0.45));
-  const grayItems = candidates
-    .filter((item) => item.saturation < 0.14)
-    .sort((a, b) => b.count - a.count)
-    .slice(0, grayLimit);
-  const colorItems = candidates
-    .filter((item) => item.saturation >= 0.14)
-    .sort((a, b) => {
-      const scoreA = a.count * (1 + a.saturation * 3) + totalPixels * a.saturation * 0.012;
-      const scoreB = b.count * (1 + b.saturation * 3) + totalPixels * b.saturation * 0.012;
-      return scoreB - scoreA;
-    });
-  const selected = new Set<string>();
-
-  grayItems.forEach((item) => selected.add(item.code));
-  for (const item of colorItems) {
-    if (selected.size >= colorCount) break;
-    selected.add(item.code);
-  }
-  for (const item of candidates.sort((a, b) => b.count - a.count)) {
-    if (selected.size >= colorCount) break;
-    selected.add(item.code);
-  }
-
-  return Array.from(selected);
-}
-
-function drawImageToGrid(ctx: CanvasRenderingContext2D, image: HTMLImageElement, width: number, height: number, fitMode: FitMode) {
+function drawImageToGrid(ctx: CanvasRenderingContext2D, image: HTMLImageElement, width: number, height: number, fitMode: "contain" | "cover") {
   ctx.fillStyle = "#FFFFFF";
   ctx.fillRect(0, 0, width, height);
 
@@ -165,8 +161,7 @@ function makePattern(
   height: number,
   colorCount: number,
   useDither: boolean,
-  fitMode: FitMode,
-  paletteStrategy: PaletteStrategy,
+  method: "kmeans" | "usage",
 ) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
@@ -175,7 +170,7 @@ function makePattern(
   if (!ctx) throw new Error("Canvas not available");
 
   ctx.imageSmoothingEnabled = true;
-  drawImageToGrid(ctx, image, width, height, fitMode);
+  drawImageToGrid(ctx, image, width, height, "contain");
 
   const imageData = ctx.getImageData(0, 0, width, height);
   const sourcePixels: Rgb[] = [];
@@ -187,14 +182,29 @@ function makePattern(
     });
   }
 
-  const initialMapped = sourcePixels.map((pixel) => nearestColor(pixel, MARD_COLORS));
-  const initialCounts = new Map<string, number>();
-  initialMapped.forEach((item) => {
-    initialCounts.set(item.code, (initialCounts.get(item.code) ?? 0) + 1);
-  });
-  const selectedCodes = choosePaletteCodes(initialCounts, colorCount, paletteStrategy);
-  const selectedPalette = MARD_COLORS.filter((item) => selectedCodes.includes(item.code));
-  const usablePalette = selectedPalette.length > 0 ? selectedPalette : MARD_COLORS;
+  let usablePalette: Array<(typeof MARD_COLORS)[number]>;
+
+  if (method === "kmeans") {
+    const k = Math.min(colorCount, sourcePixels.length);
+    const centroids = kMeans(sourcePixels, k);
+    const selectedCodes = new Set<string>();
+    centroids.forEach((c) => {
+      const mardColor = nearestColor(c, MARD_COLORS);
+      selectedCodes.add(mardColor.code);
+    });
+    usablePalette = MARD_COLORS.filter((item) => selectedCodes.has(item.code));
+  } else {
+    const mapped = sourcePixels.map((pixel) => nearestColor(pixel, MARD_COLORS));
+    const counts = new Map<string, number>();
+    mapped.forEach((item) => {
+      counts.set(item.code, (counts.get(item.code) ?? 0) + 1);
+    });
+    const topCodes = Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, colorCount)
+      .map(([code]) => code);
+    usablePalette = MARD_COLORS.filter((item) => topCodes.includes(item.code));
+  }
   const workPixels = sourcePixels.map((pixel) => ({ ...pixel }));
   const quantized: Array<(typeof MARD_COLORS)[number] | null> = [];
 
@@ -304,6 +314,60 @@ function collectConnectedSameColor(cells: Cell[], width: number, startIndex: num
   return selected;
 }
 
+function findIsolatedRegions(cells: Cell[], width: number, maxSize: number) {
+  const height = Math.ceil(cells.length / width);
+  const visited = new Set<number>();
+  const toRemove: number[] = [];
+
+  for (let i = 0; i < cells.length; i++) {
+    if (visited.has(i) || cells[i].blank) continue;
+
+    const region: number[] = [];
+    const regionSet = new Set<number>();
+    const stack = [i];
+    let isolated = true;
+
+    while (stack.length > 0) {
+      const idx = stack.pop()!;
+      if (visited.has(idx)) continue;
+      visited.add(idx);
+      const cell = cells[idx];
+      if (!cell || cell.blank) continue;
+      if (cell.label !== cells[i].label) continue;
+
+      region.push(idx);
+      regionSet.add(idx);
+
+      const x = idx % width;
+      const y = Math.floor(idx / width);
+      const neighbors = [
+        x > 0 ? idx - 1 : -1,
+        x < width - 1 ? idx + 1 : -1,
+        y > 0 ? idx - width : -1,
+        y < height - 1 ? idx + width : -1,
+      ];
+
+      for (const n of neighbors) {
+        if (n === -1) continue;
+        if (regionSet.has(n)) continue;
+        const nc = cells[n];
+        if (nc.blank) continue;
+        if (nc.label === cell.label) {
+          stack.push(n);
+        } else {
+          isolated = false;
+        }
+      }
+    }
+
+    if (isolated && region.length <= maxSize) {
+      toRemove.push(...region);
+    }
+  }
+
+  return toRemove;
+}
+
 function distributeError(
   pixels: Rgb[],
   width: number,
@@ -330,22 +394,24 @@ function drawPatternCanvas(
   height: number,
   showLabels: boolean,
   showGrid: boolean,
+  maxPreviewSize = 720,
   forExport = false,
-  exportResolution = 2,
 ) {
-  const exportTargetSize = normalizeExportResolution(exportResolution) * 1024;
-  const cellSize = forExport ? Math.max(8, Math.floor(exportTargetSize / width)) : Math.max(9, Math.floor(720 / width));
+  const cellSize = forExport
+    ? 102
+    : Math.max(9, Math.floor(maxPreviewSize / width));
+  const legendScale = forExport ? 4 : 1;
   const axisSize = cellSize;
   const gridLeft = axisSize;
   const gridTop = axisSize;
   const gridWidth = width * cellSize;
   const gridHeight = height * cellSize;
-  const legendRowHeight = forExport ? 72 : 62;
-  const legendTop = gridTop + gridHeight + (forExport ? 22 : 12);
+  const legendRowHeight = legendScale * (forExport ? 96 : 66);
+  const legendTop = gridTop + gridHeight + legendScale * (forExport ? 56 : 12);
   const legendWidth = forExport ? gridLeft + gridWidth : Math.max(gridLeft + gridWidth, 520);
-  const legendItemWidth = forExport ? 86 : 54;
+  const legendItemWidth = legendScale * (forExport ? 86 : 54);
   const legendColumns = Math.max(1, Math.floor((legendWidth - gridLeft) / legendItemWidth));
-  const legendHeight = Math.ceil(palette.length / legendColumns) * legendRowHeight + 26;
+  const legendHeight = Math.ceil(palette.length / legendColumns) * legendRowHeight + legendScale * 26;
   canvas.width = Math.max(gridLeft + gridWidth, legendWidth);
   canvas.height = legendTop + legendHeight;
 
@@ -437,14 +503,25 @@ function drawPatternCanvas(
   ctx.lineWidth = forExport ? 5 : 3;
   ctx.strokeRect(gridLeft + 0.5, gridTop + 0.5, gridWidth, gridHeight);
 
+  if (forExport) {
+    const totalBeads = palette.reduce((sum, item) => sum + item.count, 0);
+    const summary = `${width} × ${height} 格  ·  ${palette.length} 色  ·  ${totalBeads} 颗`;
+    const summaryY = gridTop + gridHeight + legendScale * 30;
+    ctx.fillStyle = "#5d6976";
+    ctx.font = `${legendScale * 18}px Arial`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(summary, gridLeft, summaryY);
+  }
+
   palette.forEach((item, index) => {
     const column = index % legendColumns;
     const row = Math.floor(index / legendColumns);
     const x = gridLeft + column * legendItemWidth;
     const y = legendTop + row * legendRowHeight;
-    const swatchWidth = forExport ? 70 : 46;
-    const swatchHeight = forExport ? 46 : 32;
-    const radius = forExport ? 10 : 6;
+    const swatchWidth = legendScale * (forExport ? 70 : 46);
+    const swatchHeight = legendScale * (forExport ? 46 : 32);
+    const radius = legendScale * (forExport ? 10 : 6);
 
     ctx.fillStyle = rgbToHex(item.color);
     ctx.beginPath();
@@ -457,14 +534,14 @@ function drawPatternCanvas(
     ctx.stroke();
 
     ctx.fillStyle = contrastColor(item.color);
-    ctx.font = `${forExport ? 24 : 15}px Arial`;
+    ctx.font = `${legendScale * (forExport ? 24 : 15)}px Arial`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(item.label, x + swatchWidth / 2, y + swatchHeight / 2 + 0.5);
 
     ctx.fillStyle = "#111827";
-    ctx.font = `${forExport ? 20 : 13}px Arial`;
-    ctx.fillText(String(item.count), x + swatchWidth / 2, y + swatchHeight + (forExport ? 20 : 14));
+    ctx.font = `${legendScale * (forExport ? 20 : 13)}px Arial`;
+    ctx.fillText(String(item.count), x + swatchWidth / 2, y + swatchHeight + legendScale * (forExport ? 20 : 14));
   });
 }
 
@@ -472,17 +549,36 @@ function App() {
   const [imageSrc, setImageSrc] = React.useState(SAMPLE_IMAGE);
   const [gridSize, setGridSize] = React.useState(40);
   const [colorCount, setColorCount] = React.useState(20);
-  const [exportResolution, setExportResolution] = React.useState(2);
-  const [fitMode, setFitMode] = React.useState<FitMode>("contain");
-  const [paletteStrategy, setPaletteStrategy] = React.useState<PaletteStrategy>("usage");
   const [showLabels, setShowLabels] = React.useState(true);
   const [showGrid, setShowGrid] = React.useState(true);
-  const [useDither, setUseDither] = React.useState(false);
+  const [quantizeMethod, setQuantizeMethod] = React.useState<"kmeans" | "usage">("kmeans");
+  const gridWidth = gridSize;
+  const gridHeight = gridSize;
+  const [displayWidth, setDisplayWidth] = React.useState<number | null>(null);
+  const [displayHeight, setDisplayHeight] = React.useState<number | null>(null);
+  const effWidth = displayWidth ?? gridWidth;
+  const effHeight = displayHeight ?? gridHeight;
+  const [autoTrim, setAutoTrim] = React.useState(true);
+  const [removeIsolated, setRemoveIsolated] = React.useState(false);
   const [pickIgnoreMode, setPickIgnoreMode] = React.useState(false);
+  const [history, setHistory] = React.useState<Array<{ baseCells: Cell[]; ignoredIndices: Set<number>; displayWidth: number | null; displayHeight: number | null }>>([]);
+
+  const pushHistory = () => {
+    setHistory((prev) => [...prev.slice(-29), { baseCells, ignoredIndices: new Set(ignoredIndices), displayWidth, displayHeight }]);
+  };
+
+  const onUndo = () => {
+    if (history.length === 0) return;
+    const last = history[history.length - 1];
+    setHistory((prev) => prev.slice(0, -1));
+    setBaseCells(last.baseCells);
+    setIgnoredIndices(last.ignoredIndices);
+    setDisplayWidth(last.displayWidth);
+    setDisplayHeight(last.displayHeight);
+  };
   const [baseCells, setBaseCells] = React.useState<Cell[]>([]);
   const [ignoredIndices, setIgnoredIndices] = React.useState<Set<number>>(new Set());
   const [isProcessing, setIsProcessing] = React.useState(false);
-  const [exportImageSrc, setExportImageSrc] = React.useState("");
   const [exportPreviewUrl, setExportPreviewUrl] = React.useState("");
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
   const cells = React.useMemo(() => applyIgnoredCells(baseCells, ignoredIndices), [baseCells, ignoredIndices]);
@@ -516,16 +612,17 @@ function App() {
         if (cancelled) return;
         const result = makePattern(
           image,
-          gridSize,
-          gridSize,
+          gridWidth,
+          gridHeight,
           colorCount,
-          useDither,
-          fitMode,
-          paletteStrategy,
+          false,
+          quantizeMethod,
         );
         setBaseCells(result.cells);
         setIgnoredIndices(new Set());
         setPickIgnoreMode(false);
+        setDisplayWidth(null);
+        setDisplayHeight(null);
         setIsProcessing(false);
       }, 20);
     };
@@ -533,12 +630,21 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [imageSrc, gridSize, colorCount, useDither, fitMode, paletteStrategy]);
+  }, [imageSrc, gridSize, colorCount, quantizeMethod]);
+
+  const previewCellSize = React.useMemo(() => {
+    const availWidth = window.innerWidth - 660;
+    const availHeight = window.innerHeight - 340;
+    const cellByW = Math.max(9, Math.floor(availWidth / (effWidth + 1)));
+    const cellByH = Math.max(9, Math.floor(availHeight / (effHeight + 1)));
+    return Math.min(cellByW, cellByH);
+  }, [effWidth, effHeight]);
+  const previewMaxSize = previewCellSize * effWidth;
 
   React.useEffect(() => {
     if (!canvasRef.current || cells.length === 0) return;
-    drawPatternCanvas(canvasRef.current, cells, palette, gridSize, gridSize, showLabels, showGrid);
-  }, [cells, palette, gridSize, showLabels, showGrid]);
+    drawPatternCanvas(canvasRef.current, cells, palette, effWidth, effHeight, showLabels, showGrid, previewMaxSize);
+  }, [cells, palette, effWidth, effHeight, showLabels, showGrid, previewMaxSize]);
 
   const onFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -551,9 +657,8 @@ function App() {
   const exportPng = () => {
     if (!cells.length) return;
     const canvas = document.createElement("canvas");
-    drawPatternCanvas(canvas, cells, palette, gridSize, gridSize, true, true, true, exportResolution);
+    drawPatternCanvas(canvas, cells, palette, effWidth, effHeight, true, true, 720, true);
     const dataUrl = canvas.toDataURL("image/png");
-    setExportImageSrc(dataUrl);
     const previewHtml = `<!doctype html>
 <html lang="zh-CN">
   <head>
@@ -600,6 +705,48 @@ function App() {
     window.open(previewUrl, "_blank", "noopener,noreferrer");
   };
 
+  const downloadPng = () => {
+    if (!cells.length) return;
+
+    const cellSize = 102;
+
+    // Clean image: no axis, grid, labels, legend
+    const cleanCanvas = document.createElement("canvas");
+    cleanCanvas.width = effWidth * cellSize;
+    cleanCanvas.height = effHeight * cellSize;
+    const cleanCtx = cleanCanvas.getContext("2d");
+    if (cleanCtx) {
+      cells.forEach((cell, index) => {
+        const x = index % effWidth;
+        const y = Math.floor(index / effWidth);
+        cleanCtx.fillStyle = cell.blank || !cell.color ? "#FFFFFF" : rgbToHex(cell.color);
+        cleanCtx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+      });
+      cleanCanvas.toBlob((blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "bead-pattern.png";
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+    }
+
+    // Full image: with axis, grid, labels, legend
+    const fullCanvas = document.createElement("canvas");
+    drawPatternCanvas(fullCanvas, cells, palette, effWidth, effHeight, true, true, 720, true);
+    fullCanvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "bead-pattern-full.png";
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  };
+
   const onCanvasClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
     if (!pickIgnoreMode || baseCells.length === 0 || !canvasRef.current) return;
 
@@ -609,20 +756,30 @@ function App() {
     const scaleY = canvas.height / rect.height;
     const canvasX = (event.clientX - rect.left) * scaleX;
     const canvasY = (event.clientY - rect.top) * scaleY;
-    const cellSize = Math.max(9, Math.floor(720 / gridSize));
+    const cellSize = previewCellSize;
     const axisSize = cellSize;
     const gridX = Math.floor((canvasX - axisSize) / cellSize);
     const gridY = Math.floor((canvasY - axisSize) / cellSize);
 
-    if (gridX < 0 || gridY < 0 || gridX >= gridSize || gridY >= gridSize) return;
+    if (gridX < 0 || gridY < 0 || gridX >= effWidth || gridY >= effHeight) return;
 
-    const startIndex = gridY * gridSize + gridX;
-    const connected = collectConnectedSameColor(baseCells, gridSize, startIndex);
+    const startIndex = gridY * effWidth + gridX;
+    const connected = collectConnectedSameColor(baseCells, effWidth, startIndex);
     if (connected.length === 0) return;
 
+    pushHistory();
     setIgnoredIndices((current) => {
       const next = new Set(current);
       connected.forEach((index) => next.add(index));
+      if (removeIsolated) {
+        const effective = applyIgnoredCells(baseCells, next);
+        const isolated = findIsolatedRegions(effective, effWidth, 20);
+        isolated.forEach((index) => next.add(index));
+      }
+      if (autoTrim) {
+        const effective = applyIgnoredCells(baseCells, next);
+        trimToFit(effective);
+      }
       return next;
     });
     setPickIgnoreMode(false);
@@ -630,11 +787,47 @@ function App() {
 
   const beadCount = palette.reduce((sum, item) => sum + item.count, 0);
 
+  const trimToFit = (effectiveCells: Cell[]) => {
+    let minX = effWidth, maxX = 0, minY = effHeight, maxY = 0;
+    effectiveCells.forEach((cell, index) => {
+      if (cell.blank) return;
+      const x = index % effWidth;
+      const y = Math.floor(index / effWidth);
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    });
+    if (maxX < minX) return;
+    const padX1 = Math.max(0, minX - 1);
+    const padY1 = Math.max(0, minY - 1);
+    const padX2 = Math.min(effWidth - 1, maxX + 1);
+    const padY2 = Math.min(effHeight - 1, maxY + 1);
+    const newWidth = padX2 - padX1 + 1;
+    const newHeight = padY2 - padY1 + 1;
+    const newCells: Cell[] = [];
+    for (let y = padY1; y <= padY2; y++) {
+      for (let x = padX1; x <= padX2; x++) {
+        newCells.push(effectiveCells[y * effWidth + x]);
+      }
+    }
+    setBaseCells(newCells);
+    setIgnoredIndices(new Set());
+    setDisplayWidth(newWidth);
+    setDisplayHeight(newHeight);
+  };
+
+  const onTrimToContent = () => {
+    if (cells.length === 0) return;
+    pushHistory();
+    trimToFit(cells);
+  };
+
   return (
     <main className="app">
       <aside className="panel">
         <div className="brand">
-          <Grid3X3 size={28} />
+          <Grid3X3 size={24} />
           <div>
             <h1>拼豆图纸生成器</h1>
             <p>上传图片，按 MARD 色卡生成图纸</p>
@@ -654,7 +847,7 @@ function App() {
           </div>
 
           <label>
-            <span>正方形板子格数</span>
+            <span>板子格数（较长边）</span>
             <input
               min="20"
               max="150"
@@ -675,86 +868,62 @@ function App() {
 
           <label>
             <span>最大 MARD 色数</span>
-            <input min="4" max="48" type="number" value={colorCount} onChange={(e) => setColorCount(Number(e.target.value))} />
+            <input min="4" max="60" type="number" value={colorCount} onChange={(e) => setColorCount(Number(e.target.value))} />
           </label>
-          <input min="4" max="48" type="range" value={colorCount} onChange={(e) => setColorCount(Number(e.target.value))} />
+          <input min="4" max="60" type="range" value={colorCount} onChange={(e) => setColorCount(Number(e.target.value))} />
 
           <div className="fitControl">
-            <span>图片适配</span>
+            <span>取色算法</span>
             <div className="segmented two">
               <button
                 type="button"
-                className={fitMode === "contain" ? "active" : ""}
-                onClick={() => setFitMode("contain")}
+                className={quantizeMethod === "kmeans" ? "active" : ""}
+                onClick={() => setQuantizeMethod("kmeans")}
               >
-                完整显示
+                K-means
               </button>
               <button
                 type="button"
-                className={fitMode === "cover" ? "active" : ""}
-                onClick={() => setFitMode("cover")}
-              >
-                裁剪填满
-              </button>
-            </div>
-          </div>
-
-          <div className="fitControl">
-            <span>导出分辨率</span>
-            <div className="segmented four">
-              {[1, 2, 3, 4].map((value) => (
-                <button
-                  type="button"
-                  className={exportResolution === value ? "active" : ""}
-                  key={value}
-                  onClick={() => setExportResolution(value)}
-                >
-                  {value}K
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="fitControl">
-            <span>保色策略</span>
-            <div className="segmented two">
-              <button
-                type="button"
-                className={paletteStrategy === "usage" ? "active" : ""}
-                onClick={() => setPaletteStrategy("usage")}
+                className={quantizeMethod === "usage" ? "active" : ""}
+                onClick={() => setQuantizeMethod("usage")}
               >
                 用量优先
               </button>
-              <button
-                type="button"
-                className={paletteStrategy === "representative" ? "active" : ""}
-                onClick={() => setPaletteStrategy("representative")}
-              >
-                代表性优先
-              </button>
             </div>
           </div>
+
         </section>
 
         <section className="toggles">
-          <label>
+          <label className="toggle">
+            <span className="toggleLabel">显示颜色编码</span>
             <input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} />
-            <span>显示颜色编码</span>
+            <span className="toggleTrack" />
           </label>
-          <label>
+          <label className="toggle">
+            <span className="toggleLabel">显示网格线</span>
             <input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} />
-            <span>显示网格线</span>
+            <span className="toggleTrack" />
           </label>
-          <label>
-            <input type="checkbox" checked={useDither} onChange={(e) => setUseDither(e.target.checked)} />
-            <span>启用抖动细节</span>
+          <label className="toggle">
+            <span className="toggleLabel">自动贴边</span>
+            <input type="checkbox" checked={autoTrim} onChange={(e) => setAutoTrim(e.target.checked)} />
+            <span className="toggleTrack" />
+          </label>
+          <label className="toggle">
+            <span className="toggleLabel">去除游离色块</span>
+            <input type="checkbox" checked={removeIsolated} onChange={(e) => setRemoveIsolated(e.target.checked)} />
+            <span className="toggleTrack" />
           </label>
         </section>
 
         <div className="actions">
           <button type="button" onClick={exportPng}>
+            预览导出
+          </button>
+          <button type="button" onClick={downloadPng}>
             <Download size={18} />
-            导出 PNG
+            下载 PNG
           </button>
         </div>
       </aside>
@@ -764,7 +933,7 @@ function App() {
           <div>
             <h2>图纸预览</h2>
             <p>
-              {gridSize} x {gridSize}，MARD {palette.length} 色，{beadCount} 颗
+              {effWidth} x {effHeight}，MARD {palette.length} 色，{beadCount} 颗
             </p>
           </div>
           {isProcessing && <span className="status">处理中</span>}
@@ -784,10 +953,18 @@ function App() {
                 >
                   {pickIgnoreMode ? "点击图纸取色" : "取色忽略"}
                 </button>
-                <button type="button" onClick={() => setIgnoredIndices(new Set())}>
+                <button type="button" onClick={() => { pushHistory(); setIgnoredIndices(new Set()); }}>
                   清除忽略
                 </button>
               </div>
+              <button
+                type="button"
+                className="secondary"
+                disabled={history.length === 0}
+                onClick={onUndo}
+              >
+                撤销
+              </button>
               {ignoredSummary.length > 0 && (
                 <div className="ignoredList">
                   {ignoredSummary.map((item) => (
@@ -806,18 +983,6 @@ function App() {
           </div>
         </div>
 
-        {exportImageSrc && exportPreviewUrl && (
-          <div className="exportResult">
-            <div>
-              <strong>PNG 已生成</strong>
-              <span>已打开预览页，可以在图片上右键保存。</span>
-            </div>
-            <a href={exportPreviewUrl} target="_blank" rel="noreferrer">
-              <ExternalLink size={17} />
-              打开预览页
-            </a>
-          </div>
-        )}
       </section>
     </main>
   );
