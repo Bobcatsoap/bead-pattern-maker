@@ -155,13 +155,15 @@ function drawImageToGrid(ctx: CanvasRenderingContext2D, image: HTMLImageElement,
   ctx.drawImage(image, drawX, drawY, drawWidth, drawHeight);
 }
 
+
+
 function makePattern(
   image: HTMLImageElement,
   width: number,
   height: number,
   colorCount: number,
   useDither: boolean,
-  method: "kmeans" | "usage",
+  method: "kmeans" | "pixel",
 ) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
@@ -169,7 +171,8 @@ function makePattern(
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("Canvas not available");
 
-  ctx.imageSmoothingEnabled = true;
+  // 像素图模式用最近邻插值，保留硬边缘，避免模糊混色
+  ctx.imageSmoothingEnabled = method !== "pixel";
   drawImageToGrid(ctx, image, width, height, "contain");
 
   const imageData = ctx.getImageData(0, 0, width, height);
@@ -184,7 +187,53 @@ function makePattern(
 
   let usablePalette: Array<(typeof MARD_COLORS)[number]>;
 
-  if (method === "kmeans") {
+  if (method === "pixel") {
+    // 步骤 1：提取原图唯一色并各自映射到最近 MARD 色
+    // 同色一定映射同色，消除因插值产生的中间色干扰
+    const uniqueToMard = new Map<string, (typeof MARD_COLORS)[number]>();
+    for (const pixel of sourcePixels) {
+      const key = `${pixel.r},${pixel.g},${pixel.b}`;
+      if (!uniqueToMard.has(key)) {
+        uniqueToMard.set(key, nearestColor(pixel, MARD_COLORS));
+      }
+    }
+    // 步骤 2：统计每个 MARD 色的实际用量，取前 colorCount 名
+    const mardCounts = new Map<string, number>();
+    for (const pixel of sourcePixels) {
+      const key = `${pixel.r},${pixel.g},${pixel.b}`;
+      const mard = uniqueToMard.get(key)!;
+      mardCounts.set(mard.code, (mardCounts.get(mard.code) ?? 0) + 1);
+    }
+    const topCodes = new Set(
+      Array.from(mardCounts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, colorCount)
+        .map(([code]) => code),
+    );
+    usablePalette = MARD_COLORS.filter((item) => topCodes.has(item.code));
+
+    // 步骤 3：用缓存做一对一映射（同源色 → 同 MARD 色，无抖动）
+    const colorCache = new Map<string, (typeof MARD_COLORS)[number]>();
+    const quantized = sourcePixels.map((pixel) => {
+      const key = `${pixel.r},${pixel.g},${pixel.b}`;
+      if (!colorCache.has(key)) {
+        colorCache.set(key, nearestColor(pixel, usablePalette));
+      }
+      return colorCache.get(key)!;
+    });
+
+    const paletteCounts = new Map<string, PaletteItem>();
+    quantized.forEach((item) => {
+      const current = paletteCounts.get(item.code);
+      if (current) { current.count += 1; }
+      else { paletteCounts.set(item.code, { label: item.code, hex: item.hex, color: item.color, count: 1 }); }
+    });
+    return {
+      cells: quantized.map((item) => ({ color: item.color, label: item.code, blank: false })),
+      palette: Array.from(paletteCounts.values()).sort((a, b) => b.count - a.count),
+    };
+  } else {
+    // kmeans
     const k = Math.min(colorCount, sourcePixels.length);
     const centroids = kMeans(sourcePixels, k);
     const selectedCodes = new Set<string>();
@@ -193,18 +242,8 @@ function makePattern(
       selectedCodes.add(mardColor.code);
     });
     usablePalette = MARD_COLORS.filter((item) => selectedCodes.has(item.code));
-  } else {
-    const mapped = sourcePixels.map((pixel) => nearestColor(pixel, MARD_COLORS));
-    const counts = new Map<string, number>();
-    mapped.forEach((item) => {
-      counts.set(item.code, (counts.get(item.code) ?? 0) + 1);
-    });
-    const topCodes = Array.from(counts.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, colorCount)
-      .map(([code]) => code);
-    usablePalette = MARD_COLORS.filter((item) => topCodes.includes(item.code));
   }
+
   const workPixels = sourcePixels.map((pixel) => ({ ...pixel }));
   const quantized: Array<(typeof MARD_COLORS)[number] | null> = [];
 
@@ -314,30 +353,56 @@ function collectConnectedSameColor(cells: Cell[], width: number, startIndex: num
   return selected;
 }
 
-function findIsolatedRegions(cells: Cell[], width: number, maxSize: number) {
-  const height = Math.ceil(cells.length / width);
+/**
+ * 找出背景/边缘散点：面积 ≤ maxSize 且周长中空白占比 ≥ blankRatioThreshold 的连通区域。
+ *
+ * 判断逻辑：收集同色连通区域后，统计其「周长格」（不属于本区域的四邻格）中
+ * 空白格（blank）vs 其他颜色格的比例。
+ * - 空白占比高 → 区域漂浮在背景中 → 删除
+ * - 空白占比低（四周都是其他颜色）→ 可能是主体细节 → 保留
+ */
+function findBackgroundSpeckles(
+  cells: Cell[],
+  width: number,
+  maxSize: number,
+  blankRatioThreshold = 0.60,
+) {
   const visited = new Set<number>();
   const toRemove: number[] = [];
+  const height = Math.ceil(cells.length / width);
 
   for (let i = 0; i < cells.length; i++) {
     if (visited.has(i) || cells[i].blank) continue;
 
+    // 第一步：收集连通区域
     const region: number[] = [];
     const regionSet = new Set<number>();
     const stack = [i];
-    let isolated = true;
 
     while (stack.length > 0) {
       const idx = stack.pop()!;
       if (visited.has(idx)) continue;
       visited.add(idx);
       const cell = cells[idx];
-      if (!cell || cell.blank) continue;
-      if (cell.label !== cells[i].label) continue;
+      if (!cell || cell.blank || cell.label !== cells[i].label) continue;
 
       region.push(idx);
       regionSet.add(idx);
+      const x = idx % width;
+      const y = Math.floor(idx / width);
+      if (x > 0) stack.push(idx - 1);
+      if (x < width - 1) stack.push(idx + 1);
+      if (y > 0) stack.push(idx - width);
+      if (y < height - 1) stack.push(idx + width);
+    }
 
+    if (region.length > maxSize) continue;
+
+    // 第二步：统计周长格中空白 vs 其他颜色的比例
+    let blankPerimeter = 0;
+    let colorPerimeter = 0;
+
+    for (const idx of region) {
       const x = idx % width;
       const y = Math.floor(idx / width);
       const neighbors = [
@@ -346,21 +411,17 @@ function findIsolatedRegions(cells: Cell[], width: number, maxSize: number) {
         y > 0 ? idx - width : -1,
         y < height - 1 ? idx + width : -1,
       ];
-
       for (const n of neighbors) {
-        if (n === -1) continue;
-        if (regionSet.has(n)) continue;
-        const nc = cells[n];
-        if (nc.blank) continue;
-        if (nc.label === cell.label) {
-          stack.push(n);
-        } else {
-          isolated = false;
-        }
+        if (n === -1) { blankPerimeter++; continue; } // 画布边缘算空白
+        if (regionSet.has(n)) continue;               // 区域内部不计
+        cells[n].blank ? blankPerimeter++ : colorPerimeter++;
       }
     }
 
-    if (isolated && region.length <= maxSize) {
+    const totalPerimeter = blankPerimeter + colorPerimeter;
+    const blankRatio = totalPerimeter === 0 ? 1 : blankPerimeter / totalPerimeter;
+
+    if (blankRatio >= blankRatioThreshold) {
       toRemove.push(...region);
     }
   }
@@ -551,15 +612,13 @@ function App() {
   const [colorCount, setColorCount] = React.useState(20);
   const [showLabels, setShowLabels] = React.useState(true);
   const [showGrid, setShowGrid] = React.useState(true);
-  const [quantizeMethod, setQuantizeMethod] = React.useState<"kmeans" | "usage">("kmeans");
+  const [quantizeMethod, setQuantizeMethod] = React.useState<"kmeans" | "pixel">("kmeans");
   const gridWidth = gridSize;
   const gridHeight = gridSize;
   const [displayWidth, setDisplayWidth] = React.useState<number | null>(null);
   const [displayHeight, setDisplayHeight] = React.useState<number | null>(null);
   const effWidth = displayWidth ?? gridWidth;
   const effHeight = displayHeight ?? gridHeight;
-  const [autoTrim, setAutoTrim] = React.useState(true);
-  const [removeIsolated, setRemoveIsolated] = React.useState(false);
   const [pickIgnoreMode, setPickIgnoreMode] = React.useState(false);
   const [history, setHistory] = React.useState<Array<{ baseCells: Cell[]; ignoredIndices: Set<number>; displayWidth: number | null; displayHeight: number | null }>>([]);
 
@@ -602,6 +661,19 @@ function App() {
       .sort((a, b) => b.count - a.count);
   }, [baseCells, ignoredIndices]);
 
+  // 一键清理散点：移除所有面积 ≤ maxSize 的同色小区域
+  const onCleanupSpeckles = () => {
+    if (cells.length === 0) return;
+    const toRemove = findBackgroundSpeckles(cells, effWidth, 20);
+    if (toRemove.length === 0) return;
+    pushHistory();
+    setIgnoredIndices((current) => {
+      const next = new Set(current);
+      toRemove.forEach((idx) => next.add(idx));
+      return next;
+    });
+  };
+
   React.useEffect(() => {
     let cancelled = false;
     const image = new Image();
@@ -630,7 +702,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [imageSrc, gridSize, colorCount, quantizeMethod]);
+  }, [imageSrc, gridWidth, gridHeight, colorCount, quantizeMethod]);
 
   const previewCellSize = React.useMemo(() => {
     const availWidth = window.innerWidth - 660;
@@ -771,15 +843,6 @@ function App() {
     setIgnoredIndices((current) => {
       const next = new Set(current);
       connected.forEach((index) => next.add(index));
-      if (removeIsolated) {
-        const effective = applyIgnoredCells(baseCells, next);
-        const isolated = findIsolatedRegions(effective, effWidth, 20);
-        isolated.forEach((index) => next.add(index));
-      }
-      if (autoTrim) {
-        const effective = applyIgnoredCells(baseCells, next);
-        trimToFit(effective);
-      }
       return next;
     });
     setPickIgnoreMode(false);
@@ -872,49 +935,74 @@ function App() {
           </label>
           <input min="4" max="60" type="range" value={colorCount} onChange={(e) => setColorCount(Number(e.target.value))} />
 
-          <div className="fitControl">
-            <span>取色算法</span>
+          <div
+            className="fitControl"
+            style={{ cursor: "pointer" }}
+            onClick={() => setQuantizeMethod((prev) => (prev === "pixel" ? "kmeans" : "pixel"))}
+          >
+            <span style={{ userSelect: "none" }}>取色算法</span>
             <div className="segmented two">
-              <button
-                type="button"
-                className={quantizeMethod === "kmeans" ? "active" : ""}
-                onClick={() => setQuantizeMethod("kmeans")}
-              >
-                K-means
-              </button>
-              <button
-                type="button"
-                className={quantizeMethod === "usage" ? "active" : ""}
-                onClick={() => setQuantizeMethod("usage")}
-              >
-                用量优先
-              </button>
+              <div
+                className="segmented-slider"
+                style={{
+                  transform: quantizeMethod === "pixel" ? "translateX(calc(100% + 2px))" : "translateX(0)"
+                }}
+              />
+              <span className={`seg-btn ${quantizeMethod === "kmeans" ? "active" : ""}`}>
+                照片模式
+              </span>
+              <span className={`seg-btn ${quantizeMethod === "pixel" ? "active" : ""}`}>
+                像素模式
+              </span>
             </div>
           </div>
 
         </section>
 
         <section className="toggles">
-          <label className="toggle">
-            <span className="toggleLabel">显示颜色编码</span>
-            <input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} />
-            <span className="toggleTrack" />
-          </label>
-          <label className="toggle">
-            <span className="toggleLabel">显示网格线</span>
-            <input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} />
-            <span className="toggleTrack" />
-          </label>
-          <label className="toggle">
-            <span className="toggleLabel">自动贴边</span>
-            <input type="checkbox" checked={autoTrim} onChange={(e) => setAutoTrim(e.target.checked)} />
-            <span className="toggleTrack" />
-          </label>
-          <label className="toggle">
-            <span className="toggleLabel">去除游离色块</span>
-            <input type="checkbox" checked={removeIsolated} onChange={(e) => setRemoveIsolated(e.target.checked)} />
-            <span className="toggleTrack" />
-          </label>
+          <div
+            className="fitControl"
+            style={{ cursor: "pointer" }}
+            onClick={() => setShowLabels((prev) => !prev)}
+          >
+            <span style={{ userSelect: "none" }}>显示颜色编码</span>
+            <div className="segmented two">
+              <div
+                className="segmented-slider"
+                style={{
+                  transform: showLabels ? "translateX(calc(100% + 2px))" : "translateX(0)"
+                }}
+              />
+              <span className={`seg-btn ${!showLabels ? "active" : ""}`}>
+                隐藏
+              </span>
+              <span className={`seg-btn ${showLabels ? "active" : ""}`}>
+                显示
+              </span>
+            </div>
+          </div>
+
+          <div
+            className="fitControl"
+            style={{ cursor: "pointer" }}
+            onClick={() => setShowGrid((prev) => !prev)}
+          >
+            <span style={{ userSelect: "none" }}>显示网格线</span>
+            <div className="segmented two">
+              <div
+                className="segmented-slider"
+                style={{
+                  transform: showGrid ? "translateX(calc(100% + 2px))" : "translateX(0)"
+                }}
+              />
+              <span className={`seg-btn ${!showGrid ? "active" : ""}`}>
+                隐藏
+              </span>
+              <span className={`seg-btn ${showGrid ? "active" : ""}`}>
+                显示
+              </span>
+            </div>
+          </div>
         </section>
 
         <div className="actions">
@@ -945,7 +1033,7 @@ function App() {
               <img src={imageSrc} alt="原图预览" />
             </div>
             <section className="ignorePanel">
-              <div className="ignoreActions">
+              <div className="ignoreActions ignore-gap-tight">
                 <button
                   type="button"
                   className={pickIgnoreMode ? "active" : ""}
@@ -953,18 +1041,46 @@ function App() {
                 >
                   {pickIgnoreMode ? "点击图纸取色" : "取色忽略"}
                 </button>
-                <button type="button" onClick={() => { pushHistory(); setIgnoredIndices(new Set()); }}>
+              </div>
+              <div className="ignoreStack ignore-gap-tight">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={onCleanupSpeckles}
+                  disabled={cells.length === 0}
+                >
+                  清理散点
+                </button>
+              </div>
+              <div className="ignoreStack ignore-gap-double">
+                <button
+                  type="button"
+                  className="secondary danger"
+                  onClick={() => { pushHistory(); setIgnoredIndices(new Set()); }}
+                >
                   清除忽略
                 </button>
               </div>
-              <button
-                type="button"
-                className="secondary"
-                disabled={history.length === 0}
-                onClick={onUndo}
-              >
-                撤销
-              </button>
+              <div className="ignoreStack ignore-gap-double">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={onTrimToContent}
+                  disabled={cells.length === 0}
+                >
+                  贴边
+                </button>
+              </div>
+              <div className="ignoreStack ignore-gap-single">
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={history.length === 0}
+                  onClick={onUndo}
+                >
+                  撤销
+                </button>
+              </div>
               {ignoredSummary.length > 0 && (
                 <div className="ignoredList">
                   {ignoredSummary.map((item) => (
